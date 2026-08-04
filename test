@@ -1,0 +1,817 @@
+# /opt/networkat_sdwan/core/web_app/client/routes.py
+import requests
+from functools import wraps
+from flask import Blueprint, render_template, request, redirect, url_for, session, flash, jsonify, current_app
+from models import Token, Client
+from services.edge_service import EdgeService
+from services.customer_service import CustomerService
+client_bp = Blueprint('client', __name__, template_folder='templates', static_folder='static')
+customer_service = CustomerService()
+edge_service = EdgeService()
+import os
+def _get_api_headers(extra_headers=None):
+    token = "57e443f0625abfa313425a020626b078899d4db7ff8d09d59c5f7ae4d0c6d874"
+    headers = {
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {token}',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ClientApp/1.0'
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    return headers
+    
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not session.get('client_logged_in'):
+            return redirect(url_for('client.login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def _get_api_base_url():
+    return current_app.config.get('NETBIRD_API_BASE_URL', 'https://api.networkat.cloud')
+
+def _get_customer_group_peer_ids(customer):
+    """Return the set of NetBird peer IDs that belong to this customer's group."""
+    if not customer or not getattr(customer, 'netbird_group_id', None):
+        return set()
+    try:
+        base_url = _get_api_base_url()
+        headers = _get_api_headers()
+        
+        # Log payload/headers in dev environment to verify token delivery
+        resp = requests.get(
+            f"{base_url}/api/v2/netbird/groups/{customer.netbird_group_id}",
+            headers=headers,
+            timeout=5
+        )
+        if resp.status_code != 200:
+            current_app.logger.error(
+                f"NetBird API Group Fetch Failed [Status {resp.status_code}]: {resp.text}"
+            )
+            return set()
+            
+        group_data = resp.json()
+        peers = group_data.get("peers") or []
+        return {p["id"] for p in peers}
+    except Exception as e:
+        current_app.logger.error(f"Failed to fetch customer peer group: {e}")
+        return set()
+
+def _verify_peer_access(customer, peer_id):
+    """Helper function to authorize if peer_id belongs to the current customer."""
+    allowed_peers = _get_customer_group_peer_ids(customer)
+    return peer_id in allowed_peers
+
+
+# --------------------------------------------------------------------------
+# Auth Routes
+# --------------------------------------------------------------------------
+
+@client_bp.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        success, res = customer_service.authenticate_client_user(username, password)
+        if success:
+            session['client_logged_in'] = True
+            session['client_user_id'] = res['id']
+            session['client_customer_id'] = res['customer_id']
+            session['client_customer_name'] = res['customer_name']
+            session['client_username'] = username
+            return redirect(url_for('client.dashboard'))
+        flash(res, 'error')
+    return render_template('login.html')
+
+
+@client_bp.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('client.login'))
+
+
+@client_bp.route('/register', methods=['GET', 'POST'])
+def register():
+    if session.get('client_logged_in'):
+        return redirect(url_for('client.dashboard'))
+    if request.method == 'POST':
+        name = request.form.get('name', '').strip()
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
+        subnet = request.form.get('subnet', '192.168.1.1')
+        mode = request.form.get('mode', 'sdwan_full')
+
+        if not name or not username or not password:
+            flash("All fields are required.", "error")
+            return render_template('register.html')
+        if len(password) < 6:
+            flash("Password must be at least 6 characters.", "error")
+            return render_template('register.html')
+
+        existing_user = customer_service.user_repo.get_client_user_by_username(username)
+        if existing_user:
+            flash(f'Username "{username}" is already taken. Please choose another.', "error")
+            return render_template('register.html')
+
+        success, res = customer_service.create_customer(name, subnet, mode, username, password)
+        if success:
+            flash("Account created successfully! Please sign in with your credentials.", "success")
+            return redirect(url_for('client.login'))
+
+        error_msg = str(res)
+        if "customers_name_key" in error_msg or "duplicate key value violates unique constraint" in error_msg:
+            error_msg = f'Company name "{name}" is already registered.'
+        elif "client_users_username_key" in error_msg:
+            error_msg = f'Username "{username}" already exists.'
+        flash(error_msg, "error")
+
+    return render_template('register.html')
+
+
+# --------------------------------------------------------------------------
+# Dashboard & Views
+# --------------------------------------------------------------------------
+
+@client_bp.route('/')
+@login_required
+def dashboard():
+    customer_id = session.get('client_customer_id')
+    customer_name = session.get('client_customer_name')
+    data = edge_service.get_client_dashboard_data(customer_id, customer_name, online_window=300)
+    if not data:
+        flash("Customer not found", "error")
+        return redirect(url_for('client.login'))
+    return render_template('dashboard.html', **data)
+
+
+@client_bp.route('/peers/<peer_id>/filtering')
+@login_required
+def peer_filtering(peer_id):
+    customer_id = session.get('client_customer_id')
+    customer = Client.query.get(customer_id) if customer_id else None
+    
+    if not customer or not _verify_peer_access(customer, peer_id):
+        flash("Unauthorized access to this device.", "error")
+        return redirect(url_for('client.dashboard'))
+
+    peer_name = request.args.get('name', 'Edge Device')
+    return render_template(
+        'filtering.html',
+        peer_id=peer_id,
+        peer_name=peer_name,
+        customer_name=session.get('client_customer_name')
+    )
+
+
+# --------------------------------------------------------------------------
+# API Endpoints
+# --------------------------------------------------------------------------
+
+@client_bp.route('/api/me')
+@login_required
+def api_me():
+    return jsonify({'user': {'username': session.get('client_username', '')}})
+
+
+@client_bp.route('/api/customer/setup-keys', methods=['GET'])
+@login_required
+def get_customer_setup_keys():
+    customer_id = session.get('client_customer_id')
+    if not customer_id:
+        return jsonify({"error": "Customer association not found"}), 404
+    try:
+        tokens = Token.query.filter_by(client_id=customer_id).all()
+        tokens_data = [
+            {
+                "token": t.token,
+                "is_active": t.is_active,
+                "created_at": t.created_at.strftime("%Y-%m-%d %H:%M:%S") if t.created_at else "Unknown"
+            }
+            for t in tokens
+        ]
+        return jsonify({"tokens": tokens_data}), 200
+    except Exception as e:
+        return jsonify({"error": "Database error", "details": str(e)}), 500
+
+
+@client_bp.route('/peers/<peer_id>/update', methods=['POST'])
+@login_required
+def update_peer(peer_id):
+    customer_id = session.get('client_customer_id')
+    customer = Client.query.get(customer_id) if customer_id else None
+    
+    if not customer or not _verify_peer_access(customer, peer_id):
+        return jsonify({'success': False, 'error': 'Unauthorized peer access'}), 403
+
+    data = request.get_json() or {}
+    new_name = data.get('name', '').strip()
+    if not new_name:
+        return jsonify({'success': False, 'error': 'Device name cannot be empty'}), 400
+
+    success, message = edge_service.update_peer_name(peer_id, new_name)
+    if success:
+        return jsonify({'success': True, 'message': message})
+    return jsonify({'success': False, 'error': message}), 400
+
+
+@client_bp.route('/api/peers', methods=['GET'])
+@login_required
+def proxy_peers():
+    customer_id = session.get('client_customer_id')
+    customer = Client.query.get(customer_id) if customer_id else None
+    if not customer:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    allowed_peer_ids = _get_customer_group_peer_ids(customer)
+    peer_name = request.args.get('name', '')
+    try:
+        url = f"{_get_api_base_url()}/api/v2/netbird/peers"
+        params = {'name': peer_name} if peer_name else {}
+        response = requests.get(url, params=params, headers=_get_api_headers(), timeout=5)
+
+        if response.status_code != 200:
+            return jsonify(response.json()), response.status_code
+
+        peers_data = response.json()
+        if isinstance(peers_data, dict):
+            peers_data = [peers_data]
+
+        sanitized_peers = [
+            {
+                "id": p.get("id"),
+                "name": p.get("name"),
+                "connected": p.get("connected", False),
+                "last_seen": p.get("last_seen"),
+                "ip": p.get("ip")
+            }
+            for p in peers_data if p.get("id") in allowed_peer_ids
+        ]
+        return jsonify(sanitized_peers), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@client_bp.route('/api/peers/<peer_id>/handshake')
+@login_required
+def peer_handshake(peer_id):
+    customer_id = session.get('client_customer_id')
+    customer = Client.query.get(customer_id) if customer_id else None
+    
+    if not customer or not _verify_peer_access(customer, peer_id):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    try:
+        url = f"{_get_api_base_url()}/api/v1/peers/{peer_id}/handshake"
+        resp = requests.get(url, headers=_get_api_headers(), timeout=5)
+        if resp.ok:
+            return jsonify(resp.json())
+        return jsonify({"peer_id": peer_id, "is_reachable": False}), resp.status_code
+    except Exception as e:
+        return jsonify({"peer_id": peer_id, "is_reachable": False, "error": str(e)}), 500
+
+
+@client_bp.route('/api/peers/<peer_id>/adguard/blocked_services', methods=['GET'])
+@login_required
+def get_peer_blocked_services(peer_id):
+    customer_id = session.get('client_customer_id')
+    customer = Client.query.get(customer_id) if customer_id else None
+
+    if not customer or not _verify_peer_access(customer, peer_id):
+        return jsonify({"error": "Unauthorized peer access"}), 403
+
+    try:
+        url = f"{_get_api_base_url()}/api/v1/peers/{peer_id}/adguard/blocked_services"
+        resp = requests.get(url, headers=_get_api_headers(), timeout=10)
+        if resp.ok:
+            return jsonify(resp.json())
+        return jsonify({"error": "Failed to fetch blocked services"}), resp.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@client_bp.route('/api/peers/<peer_id>/adguard/blocked_services', methods=['POST', 'PUT'])
+@login_required
+def update_peer_blocked_services(peer_id):
+    customer_id = session.get('client_customer_id')
+    customer = Client.query.get(customer_id) if customer_id else None
+
+    if not customer or not _verify_peer_access(customer, peer_id):
+        return jsonify({"error": "Unauthorized peer access"}), 403
+
+    try:
+        payload = request.get_json() or {}
+        headers = _get_api_headers({'Content-Type': 'application/json'})
+        url = f"{_get_api_base_url()}/api/v1/peers/{peer_id}/adguard/blocked_services"
+        resp = requests.post(url, json=payload, headers=headers, timeout=10)
+        if resp.ok:
+            return jsonify(resp.json())
+        return jsonify({"error": "Failed to update blocked services", "details": resp.text}), resp.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --------------------------------------------------------------------------
+# NetBird Routes Proxy
+# --------------------------------------------------------------------------
+
+@client_bp.route('/api/v2/netbird/routes', methods=['GET'])
+@login_required
+def proxy_get_routes():
+    customer_id = session.get('client_customer_id')
+    customer = Client.query.get(customer_id) if customer_id else None
+    if not customer:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    allowed_peer_ids = _get_customer_group_peer_ids(customer)
+    try:
+        url = f"{_get_api_base_url()}/api/v2/netbird/routes"
+        response = requests.get(url, headers=_get_api_headers(), timeout=10)
+        if response.status_code != 200:
+            return jsonify(response.json()), response.status_code
+
+        all_routes = response.json()
+        sanitized_routes = [
+            {
+                "id": r.get("id"),
+                "peer": r.get("peer"),
+                "network": r.get("network"),
+                "network_id": r.get("network_id"),
+                "enabled": r.get("enabled", True),
+                "description": r.get("description", "")
+            }
+            for r in all_routes if r.get("peer") in allowed_peer_ids
+        ]
+        return jsonify(sanitized_routes), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@client_bp.route('/api/v2/netbird/routes', methods=['POST'])
+@login_required
+def proxy_post_route():
+    headers = _get_api_headers({"Content-Type": "application/json"})
+    try:
+        req_data = request.get_json() or {}
+        customer_id = session.get('client_customer_id')
+        username = session.get('client_username', 'user')
+
+        if not customer_id:
+            return jsonify({"error": "Unauthorized"}), 401
+
+        customer = Client.query.get(customer_id)
+        if not customer or not getattr(customer, 'netbird_group_id', None):
+            return jsonify({"error": "NetBird Group ID not found for this customer"}), 400
+
+        if not _verify_peer_access(customer, req_data.get("peer")):
+            return jsonify({"error": "This peer does not belong to your account"}), 403
+
+        netbird_group_id = customer.netbird_group_id
+        req_data["groups"] = [netbird_group_id]
+        req_data["access_control_groups"] = [netbird_group_id]
+
+        if not req_data.get("network_id") or req_data.get("network_id").startswith("route-"):
+            peer_id = req_data.get("peer", "")[:5]
+            req_data["network_id"] = f"{username.lower()}-{peer_id}"
+
+        req_data.pop("peer_groups", None)
+
+        url = f"{_get_api_base_url()}/api/v2/netbird/routes"
+        response = requests.post(url, json=req_data, headers=headers, timeout=10)
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@client_bp.route('/api/v2/netbird/routes/<route_id>', methods=['PUT'])
+@login_required
+def proxy_put_route(route_id):
+    headers = _get_api_headers({"Content-Type": "application/json"})
+    try:
+        req_data = request.get_json() or {}
+        customer_id = session.get('client_customer_id')
+
+        if not customer_id:
+            return jsonify({"error": "Unauthorized"}), 401
+
+        customer = Client.query.get(customer_id)
+        if not customer or not getattr(customer, 'netbird_group_id', None):
+            return jsonify({"error": "NetBird Group ID not found for this customer"}), 400
+
+        if not _verify_peer_access(customer, req_data.get("peer")):
+            return jsonify({"error": "This peer does not belong to your account"}), 403
+
+        netbird_group_id = customer.netbird_group_id
+        req_data["groups"] = [netbird_group_id]
+        req_data["access_control_groups"] = [netbird_group_id]
+        req_data.pop("peer_groups", None)
+
+        url = f"{_get_api_base_url()}/api/v2/netbird/routes/{route_id}"
+        response = requests.put(url, json=req_data, headers=headers, timeout=10)
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@client_bp.route('/api/v2/netbird/routes/<route_id>', methods=['DELETE'])
+@login_required
+def proxy_delete_route(route_id):
+    customer_id = session.get('client_customer_id')
+    customer = Client.query.get(customer_id) if customer_id else None
+    if not customer:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    base_url = _get_api_base_url()
+    try:
+        allowed_peer_ids = _get_customer_group_peer_ids(customer)
+        check_resp = requests.get(f"{base_url}/api/v2/netbird/routes/{route_id}", headers=_get_api_headers(), timeout=5)
+        
+        if check_resp.status_code == 200:
+            route_data = check_resp.json()
+            if route_data.get("peer") not in allowed_peer_ids:
+                return jsonify({"error": "This route does not belong to your account"}), 403
+        else:
+            return jsonify({"error": "Failed to verify route ownership"}), check_resp.status_code
+    except Exception as e:
+        return jsonify({"error": "Error verifying ownership before deletion", "details": str(e)}), 500
+
+    try:
+        response = requests.delete(f"{base_url}/api/v2/netbird/routes/{route_id}", headers=_get_api_headers(), timeout=10)
+        if response.status_code in [200, 204]:
+            return '', response.status_code
+        return jsonify(response.json()), response.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+<!--/opt/networkat_sdwan/core/web_app/client/templates/dashboard.html جدول الأجهزة المطور -->
+<div class="card">
+<div class="card-header">
+<h3><i class="fas fa-desktop"></i> Your Edge Devices</h3>
+</div>
+<div class="table-responsive">
+<table>
+<thead>
+<tr>
+<!-- <th>Peer ID</th> -->
+<th>Device Name</th>
+<th>Network Route</th> <!-- العمود الجديد -->
+<th>Status</th>
+<th>Actions</th>
+</tr>
+</thead>
+<tbody>
+{% if netbird_peers and netbird_peers|length > 0 %}
+{% for peer in netbird_peers %}
+<tr>
+<td>
+<input type="text" class="table-input" id="inline-name-{{ peer.id }}"
+value="{{ peer.name }}" placeholder="Device Name">
+</td>
+<td>
+<input type="text" class="table-input inline-route-field"
+id="inline-route-{{ peer.id }}" data-peer-id="{{ peer.id }}"
+placeholder="e.g. 192.168.87.0/24" value="{{ peer.route or '' }}">
+</td>
+<td>
+<span
+class="badge {% if peer.connected %}badge-success{% else %}badge-inactive{% endif %}"
+id="status-badge-{{ peer.id }}" data-peer-name="{{ peer.name }}"
+data-last-seen="{{ peer.last_seen or '' }}">
+<i class="fas fa-circle" style="font-size: 0.5rem;"></i>
+{% if peer.connected %}
+Connected
+{% else %}
+Offline
+{% endif %}
+</span>
+</td>
+<td>
+<div class="actions-cell">
+<button class="action-btn btn-success-style"
+onclick="saveInlineChanges('{{ peer.id }}')">
+<i class="fas fa-save"></i> Save
+</button>
+<a href="/peers/{{ peer.id }}/filtering?name={{ peer.name | urlencode }}" 
+id="filter-link-{{ peer.id }}"
+target="_blank" 
+class="action-btn"
+style="background-color: #00b06f; color: white; text-decoration: none; display: inline-flex; align-items: center; gap: 0.35rem;">
+    <i class="fas fa-shield-alt"></i> Filters
+</a>
+</div>
+
+</td>
+</tr>
+{% endfor %}
+{% else %}
+<tr>
+<td colspan="5" class="text-center"
+style="text-align: center; padding: 3rem; color: var(--gray-600);">
+No edge devices found in this customer group.
+</td>
+</tr>
+{% endif %}
+</tbody>
+</table>
+</div>
+</div>
+<div class="footer">
+<i class="fas fa-circle" style="color: #10b981; font-size: 0.5rem;"></i> Online ·
+<i class="fas fa-circle" style="color: #f59e0b; font-size: 0.5rem;"></i> Stale (>5min) ·
+<i class="fas fa-circle" style="color: var(--gray-600); font-size: 0.5rem;"></i> Offline
+</div>
+</div>
+<!--  -->
+<script>
+// إغلاق المودالز تلقائياً عند الضغط خارج المساحة البيضاء للمودال
+window.onclick = function (event) {
+if (event.target.classList.contains('custom-modal')) {
+event.target.classList.remove('show');
+}
+}
+
+async function fetchAndPopulateInlineRoutes() {
+try {
+// 1. جلب الـ Routes والـ Peers بالتوازي
+const [routesRes, peersRes] = await Promise.all([
+fetch('/api/v2/netbird/routes').catch(() => null),
+fetch('/api/peers').catch(() => null)
+]);
+
+const routes = (routesRes && routesRes.ok) ? await routesRes.json() : [];
+const peers = (peersRes && peersRes.ok) ? await peersRes.json() : [];
+
+const routeInputs = document.querySelectorAll('.inline-route-field');
+
+// 2. فحص الـ Handshake للأجهزة بالتوازي (In Parallel) مع مهلة 2.5 ثوانٍ فقط
+const handshakePromises = Array.from(routeInputs).map(async (input) => {
+const peerId = input.getAttribute('data-peer-id');
+const peerData = peers.find(p => p.id === peerId);
+const isConnected = peerData ? (peerData.connected === true) : false;
+
+let isReachable = false;
+
+if (isConnected) {
+// إيقاف الريكويست فوراً لو تأخر عن 2.5 ثانية
+const controller = new AbortController();
+const timeoutId = setTimeout(() => controller.abort(), 2500);
+
+try {
+const hsRes = await fetch(`/api/peers/${peerId}/handshake`, { signal: controller.signal });
+clearTimeout(timeoutId);
+if (hsRes.ok) {
+const hsData = await hsRes.json();
+isReachable = (hsData.is_reachable === true);
+}
+} catch (err) {
+// عند حدوث Timeout أو خطأ 500 يتحول أوفلاين فوراً دون تعطيل الصفحة
+isReachable = false;
+}
+}
+
+return { peerId, isConnected, isReachable, peerData };
+});
+
+// انتظار رد جميع الأجهزة معاً
+const handshakeResults = await Promise.all(handshakePromises);
+const handshakeMap = new Map(handshakeResults.map(item => [item.peerId, item]));
+
+let totalEdges = routeInputs.length;
+let onlineEdges = 0;
+let offlineEdges = 0;
+
+// 3. تحديث واجهة المستخدم بالنتائج
+for (const input of routeInputs) {
+const peerId = input.getAttribute('data-peer-id');
+const peerRoute = routes.find(r => r.peer === peerId);
+const hsStatus = handshakeMap.get(peerId) || {};
+
+if (document.activeElement !== input) {
+input.value = peerRoute ? peerRoute.network : '';
+}
+
+if (peerRoute) {
+input.setAttribute('data-route-id', peerRoute.id);
+input.setAttribute('data-route-network-id', peerRoute.network_id);
+} else {
+input.removeAttribute('data-route-id');
+input.removeAttribute('data-route-network-id');
+}
+
+const statusBadge = document.getElementById(`status-badge-${peerId}`);
+const isConnected = hsStatus.isConnected;
+const isReachable = hsStatus.isReachable;
+const lastSeenRaw = (hsStatus.peerData && hsStatus.peerData.last_seen) 
+? hsStatus.peerData.last_seen 
+: (statusBadge ? statusBadge.getAttribute('data-last-seen') : '');
+
+if (statusBadge) {
+const timeAgoText = timeAgo(lastSeenRaw);
+
+statusBadge.style.backgroundColor = "";
+statusBadge.style.color = "";
+
+if (isConnected && isReachable) {
+// متصل حقيقي (NetBird متصل + الـ Agent رد على الـ Handshake)
+statusBadge.className = "badge badge-success";
+statusBadge.innerHTML = `<i class="fas fa-circle" style="font-size: 0.5rem;"></i> Connected`;
+onlineEdges++;
+} else if (isConnected && !isReachable) {
+// NetBird شايفه متصل لكن الـ Agent مش رادّ
+statusBadge.className = "badge badge-inactive";
+statusBadge.innerHTML = `<i class="fas fa-circle" style="font-size: 0.5rem;"></i> Offline (.${timeAgoText})`;
+offlineEdges++;
+} else {
+// غير متصل اصلاً
+statusBadge.className = "badge badge-inactive";
+statusBadge.innerHTML = `<i class="fas fa-circle" style="font-size: 0.5rem;"></i> Offline (${timeAgoText})`;
+offlineEdges++;
+}
+}
+}
+
+const totalEl = document.getElementById('total-edges-val');
+const onlineEl = document.getElementById('online-edges-val');
+const offlineEl = document.getElementById('offline-edges-val');
+
+if (totalEl) totalEl.innerText = totalEdges;
+if (onlineEl) onlineEl.innerText = onlineEdges;
+if (offlineEl) offlineEl.innerText = offlineEdges;
+
+} catch (error) {
+console.error('Error auto-populating inline routes & statuses:', error);
+}
+}
+
+async function saveInlineChanges(peerId) {
+const nameInput = document.getElementById(`inline-name-${peerId}`);
+const routeInput = document.getElementById(`inline-route-${peerId}`);
+
+const newName = nameInput ? nameInput.value.trim() : '';
+const newRouteNetwork = routeInput ? routeInput.value.trim() : '';
+
+if (!newName) {
+alert('Please enter a valid device name.');
+return;
+}
+
+try {
+// 1. تحديث اسم الجهاز
+const nameResponse = await fetch(`/peers/${peerId}/update`, {
+method: 'POST',
+headers: { 'Content-Type': 'application/json' },
+body: JSON.stringify({ name: newName })
+});
+
+const nameData = await nameResponse.json();
+if (!nameResponse.ok || nameData.error) {
+throw new Error(nameData.error || 'Failed to update device name.');
+}
+
+// 2. تحديث أو إنشاء الـ Route
+const existingRouteId = routeInput.getAttribute('data-route-id');
+const existingNetworkId = routeInput.getAttribute('data-route-network-id');
+
+if (newRouteNetwork) {
+// الحفاظ على network_id الأصلي لمنع رفض NetBird لطلب الـ PUT
+const networkId = existingNetworkId || `route-${peerId.substring(0, 8)}`;
+
+const routeBody = {
+"description": `Route handled via inline dashboard for peer ${peerId}`,
+"network_id": networkId,
+"enabled": true,
+"peer": peerId,
+"network": newRouteNetwork,
+"metric": 9999,
+"masquerade": true,
+"keep_route": true,
+"groups": []
+};
+
+if (existingRouteId && existingRouteId !== 'null' && existingRouteId !== 'undefined') {
+// تعديل مسار قائم (PUT) مع فحص الاستجابة
+const routeRes = await fetch(`/api/v2/netbird/routes/${existingRouteId}`, {
+method: 'PUT',
+headers: { 'Content-Type': 'application/json' },
+body: JSON.stringify(routeBody)
+});
+
+if (!routeRes.ok) {
+const errData = await routeRes.json().catch(() => ({}));
+throw new Error(errData.message || errData.detail || `Route PUT failed with status ${routeRes.status}`);
+}
+} else {
+// إنشاء مسار جديد (POST) مع فحص الاستجابة
+const createRes = await fetch('/api/v2/netbird/routes', {
+method: 'POST',
+headers: { 'Content-Type': 'application/json' },
+body: JSON.stringify(routeBody)
+});
+
+if (!createRes.ok) {
+const errData = await createRes.json().catch(() => ({}));
+throw new Error(errData.message || errData.detail || `Route POST failed with status ${createRes.status}`);
+}
+}
+} else if (existingRouteId) {
+// إذا قمت بمسح الخانة بالكامل وكان هناك Route سابق، نقوم بحذفه
+await fetch(`/api/v2/netbird/routes/${existingRouteId}`, { method: 'DELETE' });
+}
+
+// تحديث واجهة المستخدم بالبيانات الجديدة فوراً لتسجيل الـ data-route-id الجديد
+await fetchAndPopulateInlineRoutes();
+
+alert('Device adjustments saved successfully!');
+} catch (error) {
+console.error('Save Error:', error);
+alert('Error while saving updates: ' + error.message);
+}
+}
+
+// جلب مفاتيح الإعداد Setup Keys من السيرفر
+function fetchSetupKeys() {
+fetch('/api/customer/setup-keys')
+.then(response => response.json())
+.then(data => {
+const tbody = document.getElementById('setup-keys-table-body');
+tbody.innerHTML = '';
+
+if (data.tokens && data.tokens.length > 0) {
+data.tokens.forEach(tokenObj => {
+const statusClass = tokenObj.is_active ? 'badge-active' : 'badge-inactive';
+const statusText = tokenObj.is_active ? 'Active' : 'Inactive';
+
+const row = `
+<tr>
+<td>
+<div class="token-container">
+<span class="token-value">${tokenObj.token}</span>
+<button class="copy-btn" onclick="copySetupKey('${tokenObj.token}', this)" title="Copy setup key">
+<i class="far fa-copy"></i>
+</button>
+</div>
+</td>
+<td><span class="badge ${statusClass}">${statusText}</span></td>
+<td>${tokenObj.created_at}</td>
+</tr>
+`;
+tbody.innerHTML += row;
+});
+} else {
+tbody.innerHTML = `<tr><td colspan="3" class="text-center" style="text-align: center; padding: 3rem; color: var(--gray-600);">No setup key found.</td></tr>`;
+}
+}).catch(err => console.error(err));
+}
+
+// دالة نسخ الـ Setup Key إلى الحافظة بشكل تفاعلي مرئي
+function copySetupKey(token, buttonElement) {
+navigator.clipboard.writeText(token).then(() => {
+const icon = buttonElement.querySelector('i');
+icon.className = 'fas fa-check';
+buttonElement.classList.add('copied');
+setTimeout(() => {
+icon.className = 'far fa-copy';
+buttonElement.classList.remove('copied');
+}, 2000);
+});
+}
+
+// دالة تحويل صيغة الوقت المطلقة إلى نص نسبي "منذ..."
+function timeAgo(dateString) {
+if (!dateString) return 'Never';
+const now = new Date();
+const past = new Date(dateString);
+
+// التحقق من صحة صياغة الوقت لتجنب الأخطاء البرمجية
+if (isNaN(past.getTime())) return 'Never';
+
+const msPerMinute = 60 * 1000;
+const msPerHour = msPerMinute * 60;
+const msPerDay = msPerHour * 24;
+const elapsed = now - past;
+
+if (elapsed < msPerMinute) {
+return 'Just now';
+} else if (elapsed < msPerHour) {
+return 'Since ' + Math.round(elapsed / msPerMinute) + 'm ago';
+} else if (elapsed < msPerDay) {
+return 'Since ' + Math.round(elapsed / msPerHour) + 'h ago';
+} else {
+return 'Since ' + Math.round(elapsed / msPerDay) + 'd ago';
+}
+}
+
+// تشغيل جلب البيانات الحية والمفاتيح عند تحميل كامل واجهة الصفحة وعناصرها
+document.addEventListener("DOMContentLoaded", function () {
+// 1. جلب مفاتيح الإعداد (مرة واحدة فقط عند فتح الصفحة)
+fetchSetupKeys();
+// 2. جلب حالة الأجهزة والـ Routes فوراً عند التحميل
+fetchAndPopulateInlineRoutes();
+// 3. تحديث حالة الأجهزة والـ Routes تلقائياً كل 10 ثوانٍ
+setInterval(fetchAndPopulateInlineRoutes, 10000);
+});
+</script>
+</body>
+
+</html>

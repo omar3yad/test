@@ -1,13 +1,15 @@
-# /opt/networkat_sdwan/core/web_app/client/routes.py
+#opt/networkat_sdwan/core/web_app/client/routes.py
 import requests
 from functools import wraps
 from flask import Blueprint, render_template, request, redirect, url_for, session, flash, jsonify, current_app
 from models import Token, Client
 from services.edge_service import EdgeService
 from services.customer_service import CustomerService
+
 client_bp = Blueprint('client', __name__, template_folder='templates', static_folder='static')
 customer_service = CustomerService()
 edge_service = EdgeService()
+
 import os
 def _get_api_headers(extra_headers=None):
     token = "57e443f0625abfa313425a020626b078899d4db7ff8d09d59c5f7ae4d0c6d874"
@@ -443,375 +445,141 @@ def proxy_delete_route(route_id):
         return jsonify(response.json()), response.status_code
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    
 
-<!--/opt/networkat_sdwan/core/web_app/client/templates/dashboard.html جدول الأجهزة المطور -->
-<div class="card">
-<div class="card-header">
-<h3><i class="fas fa-desktop"></i> Your Edge Devices</h3>
-</div>
-<div class="table-responsive">
-<table>
-<thead>
-<tr>
-<!-- <th>Peer ID</th> -->
-<th>Device Name</th>
-<th>Network Route</th> <!-- العمود الجديد -->
-<th>Status</th>
-<th>Actions</th>
-</tr>
-</thead>
-<tbody>
-{% if netbird_peers and netbird_peers|length > 0 %}
-{% for peer in netbird_peers %}
-<tr>
-<td>
-<input type="text" class="table-input" id="inline-name-{{ peer.id }}"
-value="{{ peer.name }}" placeholder="Device Name">
-</td>
-<td>
-<input type="text" class="table-input inline-route-field"
-id="inline-route-{{ peer.id }}" data-peer-id="{{ peer.id }}"
-placeholder="e.g. 192.168.87.0/24" value="{{ peer.route or '' }}">
-</td>
-<td>
-<span
-class="badge {% if peer.connected %}badge-success{% else %}badge-inactive{% endif %}"
-id="status-badge-{{ peer.id }}" data-peer-name="{{ peer.name }}"
-data-last-seen="{{ peer.last_seen or '' }}">
-<i class="fas fa-circle" style="font-size: 0.5rem;"></i>
-{% if peer.connected %}
-Connected
-{% else %}
-Offline
-{% endif %}
-</span>
-</td>
-<td>
-<div class="actions-cell">
-<button class="action-btn btn-success-style"
-onclick="saveInlineChanges('{{ peer.id }}')">
-<i class="fas fa-save"></i> Save
-</button>
-<a href="/peers/{{ peer.id }}/filtering?name={{ peer.name | urlencode }}" 
-id="filter-link-{{ peer.id }}"
-target="_blank" 
-class="action-btn"
-style="background-color: #00b06f; color: white; text-decoration: none; display: inline-flex; align-items: center; gap: 0.35rem;">
-    <i class="fas fa-shield-alt"></i> Filters
-</a>
-</div>
+import json
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from flask import Response, stream_with_context, current_app
 
-</td>
-</tr>
-{% endfor %}
-{% else %}
-<tr>
-<td colspan="5" class="text-center"
-style="text-align: center; padding: 3rem; color: var(--gray-600);">
-No edge devices found in this customer group.
-</td>
-</tr>
-{% endif %}
-</tbody>
-</table>
-</div>
-</div>
-<div class="footer">
-<i class="fas fa-circle" style="color: #10b981; font-size: 0.5rem;"></i> Online ·
-<i class="fas fa-circle" style="color: #f59e0b; font-size: 0.5rem;"></i> Stale (>5min) ·
-<i class="fas fa-circle" style="color: var(--gray-600); font-size: 0.5rem;"></i> Offline
-</div>
-</div>
-<!--  -->
-<script>
-// إغلاق المودالز تلقائياً عند الضغط خارج المساحة البيضاء للمودال
-window.onclick = function (event) {
-if (event.target.classList.contains('custom-modal')) {
-event.target.classList.remove('show');
-}
-}
+# إنشاء ThreadPoolExecutor عام للـ SSE يظل يعمل طوال فترة حياة السيرفر
+executor = ThreadPoolExecutor(max_workers=20)
 
-async function fetchAndPopulateInlineRoutes() {
-try {
-// 1. جلب الـ Routes والـ Peers بالتوازي
-const [routesRes, peersRes] = await Promise.all([
-fetch('/api/v2/netbird/routes').catch(() => null),
-fetch('/api/peers').catch(() => null)
-]);
+def _check_single_peer_handshake(peer, base_url, headers):
+    peer_id = peer.get("id")
+    is_connected = peer.get("connected", False)
+    is_reachable = False
 
-const routes = (routesRes && routesRes.ok) ? await routesRes.json() : [];
-const peers = (peersRes && peersRes.ok) ? await peersRes.json() : [];
+    if is_connected:
+        try:
+            hs_resp = requests.get(
+                f"{base_url}/api/v1/peers/{peer_id}/handshake",
+                headers=headers,
+                timeout=2.0
+            )
+            if hs_resp.ok:
+                is_reachable = hs_resp.json().get("is_reachable", False)
+        except Exception:
+            is_reachable = False
 
-const routeInputs = document.querySelectorAll('.inline-route-field');
+    real_online = is_connected and is_reachable
+    return {
+        "id": peer_id,
+        "name": peer.get("name"),
+        "connected": is_connected,
+        "is_reachable": is_reachable,
+        "is_online": real_online,
+        "last_seen": peer.get("last_seen"),
+        "ip": peer.get("ip")
+    }
 
-// 2. فحص الـ Handshake للأجهزة بالتوازي (In Parallel) مع مهلة 2.5 ثوانٍ فقط
-const handshakePromises = Array.from(routeInputs).map(async (input) => {
-const peerId = input.getAttribute('data-peer-id');
-const peerData = peers.find(p => p.id === peerId);
-const isConnected = peerData ? (peerData.connected === true) : false;
+@client_bp.route('/api/peers/stream')
+@login_required
+def stream_peers_status():
+    customer_id = session.get('client_customer_id')
+    customer = Client.query.get(customer_id) if customer_id else None
+    if not customer:
+        return jsonify({"error": "Unauthorized"}), 401
 
-let isReachable = false;
+    base_url = _get_api_base_url()
+    headers = _get_api_headers()
 
-if (isConnected) {
-// إيقاف الريكويست فوراً لو تأخر عن 2.5 ثانية
-const controller = new AbortController();
-const timeoutId = setTimeout(() => controller.abort(), 2500);
+    def generate_events():
+        try:
+            while True:
+                allowed_peer_ids = get_cached_customer_peer_ids(customer, base_url, headers)
+                if not allowed_peer_ids:
+                    payload = {"peers": [], "summary": {"total": 0, "online": 0, "offline": 0}}
+                    yield f"data: {json.dumps(payload)}\n\n"
+                    time.sleep(5)
+                    continue
 
-try {
-const hsRes = await fetch(`/api/peers/${peerId}/handshake`, { signal: controller.signal });
-clearTimeout(timeoutId);
-if (hsRes.ok) {
-const hsData = await hsRes.json();
-isReachable = (hsData.is_reachable === true);
-}
-} catch (err) {
-// عند حدوث Timeout أو خطأ 500 يتحول أوفلاين فوراً دون تعطيل الصفحة
-isReachable = false;
-}
-}
+                resp = requests.get(f"{base_url}/api/v2/netbird/peers", headers=headers, timeout=5)
+                if resp.status_code != 200:
+                    time.sleep(8)
+                    continue
 
-return { peerId, isConnected, isReachable, peerData };
-});
+                peers_data = resp.json()
+                if isinstance(peers_data, dict):
+                    peers_data = [peers_data]
 
-// انتظار رد جميع الأجهزة معاً
-const handshakeResults = await Promise.all(handshakePromises);
-const handshakeMap = new Map(handshakeResults.map(item => [item.peerId, item]));
+                customer_peers = [p for p in peers_data if p.get("id") in allowed_peer_ids]
 
-let totalEdges = routeInputs.length;
-let onlineEdges = 0;
-let offlineEdges = 0;
+                processed_peers = []
+                online_count = 0
+                offline_count = 0
 
-// 3. تحديث واجهة المستخدم بالنتائج
-for (const input of routeInputs) {
-const peerId = input.getAttribute('data-peer-id');
-const peerRoute = routes.find(r => r.peer === peerId);
-const hsStatus = handshakeMap.get(peerId) || {};
+                # استخدام الـ global executor بدلاً من with ThreadPoolExecutor
+                if customer_peers:
+                    futures = [
+                        executor.submit(_check_single_peer_handshake, peer, base_url, headers)
+                        for peer in customer_peers
+                    ]
+                    for future in as_completed(futures):
+                        try:
+                            res = future.result()
+                            processed_peers.append(res)
+                            if res["is_online"]:
+                                online_count += 1
+                            else:
+                                offline_count += 1
+                        except Exception as err:
+                            current_app.logger.error(f"Error checking peer: {err}")
 
-if (document.activeElement !== input) {
-input.value = peerRoute ? peerRoute.network : '';
-}
+                payload = {
+                    "peers": processed_peers,
+                    "summary": {
+                        "total": len(processed_peers),
+                        "online": online_count,
+                        "offline": offline_count
+                    }
+                }
 
-if (peerRoute) {
-input.setAttribute('data-route-id', peerRoute.id);
-input.setAttribute('data-route-network-id', peerRoute.network_id);
-} else {
-input.removeAttribute('data-route-id');
-input.removeAttribute('data-route-network-id');
-}
+                yield f"data: {json.dumps(payload)}\n\n"
+                time.sleep(8)
 
-const statusBadge = document.getElementById(`status-badge-${peerId}`);
-const isConnected = hsStatus.isConnected;
-const isReachable = hsStatus.isReachable;
-const lastSeenRaw = (hsStatus.peerData && hsStatus.peerData.last_seen) 
-? hsStatus.peerData.last_seen 
-: (statusBadge ? statusBadge.getAttribute('data-last-seen') : '');
+        except GeneratorExit:
+            # يتم استدعاؤها فور إغلاق التبويب في المتصفح
+            pass
+        except Exception as e:
+            current_app.logger.error(f"SSE Error: {e}")
 
-if (statusBadge) {
-const timeAgoText = timeAgo(lastSeenRaw);
+    return Response(
+        stream_with_context(generate_events()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+            'Connection': 'keep-alive'
+        }
+    )
 
-statusBadge.style.backgroundColor = "";
-statusBadge.style.color = "";
+from functools import lru_cache
+import time
 
-if (isConnected && isReachable) {
-// متصل حقيقي (NetBird متصل + الـ Agent رد على الـ Handshake)
-statusBadge.className = "badge badge-success";
-statusBadge.innerHTML = `<i class="fas fa-circle" style="font-size: 0.5rem;"></i> Connected`;
-onlineEdges++;
-} else if (isConnected && !isReachable) {
-// NetBird شايفه متصل لكن الـ Agent مش رادّ
-statusBadge.className = "badge badge-inactive";
-statusBadge.innerHTML = `<i class="fas fa-circle" style="font-size: 0.5rem;"></i> Offline (.${timeAgoText})`;
-offlineEdges++;
-} else {
-// غير متصل اصلاً
-statusBadge.className = "badge badge-inactive";
-statusBadge.innerHTML = `<i class="fas fa-circle" style="font-size: 0.5rem;"></i> Offline (${timeAgoText})`;
-offlineEdges++;
-}
-}
-}
+_CUSTOMER_GROUPS_CACHE = {}
+def get_cached_customer_peer_ids(customer, base_url, headers):
+    # استخدام customer_id الخاص بالموديل بدلاً من id
+    cid = getattr(customer, 'customer_id', getattr(customer, 'id', None))
+    if not cid:
+        return _get_customer_group_peer_ids(customer)
 
-const totalEl = document.getElementById('total-edges-val');
-const onlineEl = document.getElementById('online-edges-val');
-const offlineEl = document.getElementById('offline-edges-val');
+    now = time.time()
+    if cid in _CUSTOMER_GROUPS_CACHE:
+        peer_ids, cached_time = _CUSTOMER_GROUPS_CACHE[cid]
+        if now - cached_time < 30:  # 30 ثانية صلاحية
+            return peer_ids
 
-if (totalEl) totalEl.innerText = totalEdges;
-if (onlineEl) onlineEl.innerText = onlineEdges;
-if (offlineEl) offlineEl.innerText = offlineEdges;
-
-} catch (error) {
-console.error('Error auto-populating inline routes & statuses:', error);
-}
-}
-
-async function saveInlineChanges(peerId) {
-const nameInput = document.getElementById(`inline-name-${peerId}`);
-const routeInput = document.getElementById(`inline-route-${peerId}`);
-
-const newName = nameInput ? nameInput.value.trim() : '';
-const newRouteNetwork = routeInput ? routeInput.value.trim() : '';
-
-if (!newName) {
-alert('Please enter a valid device name.');
-return;
-}
-
-try {
-// 1. تحديث اسم الجهاز
-const nameResponse = await fetch(`/peers/${peerId}/update`, {
-method: 'POST',
-headers: { 'Content-Type': 'application/json' },
-body: JSON.stringify({ name: newName })
-});
-
-const nameData = await nameResponse.json();
-if (!nameResponse.ok || nameData.error) {
-throw new Error(nameData.error || 'Failed to update device name.');
-}
-
-// 2. تحديث أو إنشاء الـ Route
-const existingRouteId = routeInput.getAttribute('data-route-id');
-const existingNetworkId = routeInput.getAttribute('data-route-network-id');
-
-if (newRouteNetwork) {
-// الحفاظ على network_id الأصلي لمنع رفض NetBird لطلب الـ PUT
-const networkId = existingNetworkId || `route-${peerId.substring(0, 8)}`;
-
-const routeBody = {
-"description": `Route handled via inline dashboard for peer ${peerId}`,
-"network_id": networkId,
-"enabled": true,
-"peer": peerId,
-"network": newRouteNetwork,
-"metric": 9999,
-"masquerade": true,
-"keep_route": true,
-"groups": []
-};
-
-if (existingRouteId && existingRouteId !== 'null' && existingRouteId !== 'undefined') {
-// تعديل مسار قائم (PUT) مع فحص الاستجابة
-const routeRes = await fetch(`/api/v2/netbird/routes/${existingRouteId}`, {
-method: 'PUT',
-headers: { 'Content-Type': 'application/json' },
-body: JSON.stringify(routeBody)
-});
-
-if (!routeRes.ok) {
-const errData = await routeRes.json().catch(() => ({}));
-throw new Error(errData.message || errData.detail || `Route PUT failed with status ${routeRes.status}`);
-}
-} else {
-// إنشاء مسار جديد (POST) مع فحص الاستجابة
-const createRes = await fetch('/api/v2/netbird/routes', {
-method: 'POST',
-headers: { 'Content-Type': 'application/json' },
-body: JSON.stringify(routeBody)
-});
-
-if (!createRes.ok) {
-const errData = await createRes.json().catch(() => ({}));
-throw new Error(errData.message || errData.detail || `Route POST failed with status ${createRes.status}`);
-}
-}
-} else if (existingRouteId) {
-// إذا قمت بمسح الخانة بالكامل وكان هناك Route سابق، نقوم بحذفه
-await fetch(`/api/v2/netbird/routes/${existingRouteId}`, { method: 'DELETE' });
-}
-
-// تحديث واجهة المستخدم بالبيانات الجديدة فوراً لتسجيل الـ data-route-id الجديد
-await fetchAndPopulateInlineRoutes();
-
-alert('Device adjustments saved successfully!');
-} catch (error) {
-console.error('Save Error:', error);
-alert('Error while saving updates: ' + error.message);
-}
-}
-
-// جلب مفاتيح الإعداد Setup Keys من السيرفر
-function fetchSetupKeys() {
-fetch('/api/customer/setup-keys')
-.then(response => response.json())
-.then(data => {
-const tbody = document.getElementById('setup-keys-table-body');
-tbody.innerHTML = '';
-
-if (data.tokens && data.tokens.length > 0) {
-data.tokens.forEach(tokenObj => {
-const statusClass = tokenObj.is_active ? 'badge-active' : 'badge-inactive';
-const statusText = tokenObj.is_active ? 'Active' : 'Inactive';
-
-const row = `
-<tr>
-<td>
-<div class="token-container">
-<span class="token-value">${tokenObj.token}</span>
-<button class="copy-btn" onclick="copySetupKey('${tokenObj.token}', this)" title="Copy setup key">
-<i class="far fa-copy"></i>
-</button>
-</div>
-</td>
-<td><span class="badge ${statusClass}">${statusText}</span></td>
-<td>${tokenObj.created_at}</td>
-</tr>
-`;
-tbody.innerHTML += row;
-});
-} else {
-tbody.innerHTML = `<tr><td colspan="3" class="text-center" style="text-align: center; padding: 3rem; color: var(--gray-600);">No setup key found.</td></tr>`;
-}
-}).catch(err => console.error(err));
-}
-
-// دالة نسخ الـ Setup Key إلى الحافظة بشكل تفاعلي مرئي
-function copySetupKey(token, buttonElement) {
-navigator.clipboard.writeText(token).then(() => {
-const icon = buttonElement.querySelector('i');
-icon.className = 'fas fa-check';
-buttonElement.classList.add('copied');
-setTimeout(() => {
-icon.className = 'far fa-copy';
-buttonElement.classList.remove('copied');
-}, 2000);
-});
-}
-
-// دالة تحويل صيغة الوقت المطلقة إلى نص نسبي "منذ..."
-function timeAgo(dateString) {
-if (!dateString) return 'Never';
-const now = new Date();
-const past = new Date(dateString);
-
-// التحقق من صحة صياغة الوقت لتجنب الأخطاء البرمجية
-if (isNaN(past.getTime())) return 'Never';
-
-const msPerMinute = 60 * 1000;
-const msPerHour = msPerMinute * 60;
-const msPerDay = msPerHour * 24;
-const elapsed = now - past;
-
-if (elapsed < msPerMinute) {
-return 'Just now';
-} else if (elapsed < msPerHour) {
-return 'Since ' + Math.round(elapsed / msPerMinute) + 'm ago';
-} else if (elapsed < msPerDay) {
-return 'Since ' + Math.round(elapsed / msPerHour) + 'h ago';
-} else {
-return 'Since ' + Math.round(elapsed / msPerDay) + 'd ago';
-}
-}
-
-// تشغيل جلب البيانات الحية والمفاتيح عند تحميل كامل واجهة الصفحة وعناصرها
-document.addEventListener("DOMContentLoaded", function () {
-// 1. جلب مفاتيح الإعداد (مرة واحدة فقط عند فتح الصفحة)
-fetchSetupKeys();
-// 2. جلب حالة الأجهزة والـ Routes فوراً عند التحميل
-fetchAndPopulateInlineRoutes();
-// 3. تحديث حالة الأجهزة والـ Routes تلقائياً كل 10 ثوانٍ
-setInterval(fetchAndPopulateInlineRoutes, 10000);
-});
-</script>
-</body>
-
-</html>
+    peer_ids = _get_customer_group_peer_ids(customer)
+    _CUSTOMER_GROUPS_CACHE[cid] = (peer_ids, now)
+    return peer_ids

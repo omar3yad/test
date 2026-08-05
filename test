@@ -1,10 +1,13 @@
 #opt/networkat_sdwan/core/web_app/client/routes.py
+import time
+import json
 import requests
 from functools import wraps
-from flask import Blueprint, render_template, request, redirect, url_for, session, flash, jsonify, current_app
 from models import Token, Client
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from services.edge_service import EdgeService
 from services.customer_service import CustomerService
+from flask import Blueprint, render_template, request, redirect, url_for, session, flash, jsonify, current_app, Response, stream_with_context
 
 client_bp = Blueprint('client', __name__, template_folder='templates', static_folder='static')
 customer_service = CustomerService()
@@ -62,10 +65,9 @@ def _get_customer_group_peer_ids(customer):
         return set()
 
 def _verify_peer_access(customer, peer_id):
-    """Helper function to authorize if peer_id belongs to the current customer."""
-    allowed_peers = _get_customer_group_peer_ids(customer)
+    """استخدام الكاش للتحقق من الصلاحيات بسرعة بدون طلب API جديد"""
+    allowed_peers = get_cached_customer_peer_ids(customer)
     return peer_id in allowed_peers
-
 
 # --------------------------------------------------------------------------
 # Auth Routes
@@ -226,19 +228,11 @@ def proxy_peers():
     if not customer:
         return jsonify({"error": "Unauthorized"}), 401
 
-    allowed_peer_ids = _get_customer_group_peer_ids(customer)
-    peer_name = request.args.get('name', '')
+    allowed_peer_ids = get_cached_customer_peer_ids(customer)
+    peer_name = request.args.get('name', '').lower()
+    
     try:
-        url = f"{_get_api_base_url()}/api/v2/netbird/peers"
-        params = {'name': peer_name} if peer_name else {}
-        response = requests.get(url, params=params, headers=_get_api_headers(), timeout=5)
-
-        if response.status_code != 200:
-            return jsonify(response.json()), response.status_code
-
-        peers_data = response.json()
-        if isinstance(peers_data, dict):
-            peers_data = [peers_data]
+        peers_data = get_cached_all_netbird_peers(_get_api_base_url(), _get_api_headers())
 
         sanitized_peers = [
             {
@@ -248,12 +242,12 @@ def proxy_peers():
                 "last_seen": p.get("last_seen"),
                 "ip": p.get("ip")
             }
-            for p in peers_data if p.get("id") in allowed_peer_ids
+            for p in peers_data 
+            if p.get("id") in allowed_peer_ids and (not peer_name or peer_name in p.get("name", "").lower())
         ]
         return jsonify(sanitized_peers), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
 
 @client_bp.route('/api/peers/<peer_id>/handshake')
 @login_required
@@ -446,12 +440,6 @@ def proxy_delete_route(route_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
-
-import json
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from flask import Response, stream_with_context, current_app
-
 # إنشاء ThreadPoolExecutor عام للـ SSE يظل يعمل طوال فترة حياة السيرفر
 executor = ThreadPoolExecutor(max_workers=20)
 
@@ -497,29 +485,22 @@ def stream_peers_status():
     def generate_events():
         try:
             while True:
-                allowed_peer_ids = get_cached_customer_peer_ids(customer, base_url, headers)
+                # 1. جلب الـ peer IDs المسموحة من الكاش
+                allowed_peer_ids = get_cached_customer_peer_ids(customer)
                 if not allowed_peer_ids:
                     payload = {"peers": [], "summary": {"total": 0, "online": 0, "offline": 0}}
                     yield f"data: {json.dumps(payload)}\n\n"
-                    time.sleep(5)
+                    time.sleep(10)
                     continue
 
-                resp = requests.get(f"{base_url}/api/v2/netbird/peers", headers=headers, timeout=5)
-                if resp.status_code != 200:
-                    time.sleep(8)
-                    continue
-
-                peers_data = resp.json()
-                if isinstance(peers_data, dict):
-                    peers_data = [peers_data]
-
+                # 2. جلب قائمة الـ peers من الكاش بدلاً من API المباشر كل مرة
+                peers_data = get_cached_all_netbird_peers(base_url, headers, cache_ttl=5)
                 customer_peers = [p for p in peers_data if p.get("id") in allowed_peer_ids]
 
                 processed_peers = []
                 online_count = 0
                 offline_count = 0
 
-                # استخدام الـ global executor بدلاً من with ThreadPoolExecutor
                 if customer_peers:
                     futures = [
                         executor.submit(_check_single_peer_handshake, peer, base_url, headers)
@@ -546,10 +527,11 @@ def stream_peers_status():
                 }
 
                 yield f"data: {json.dumps(payload)}\n\n"
-                time.sleep(8)
+                
+                # زيادة الفاصل الزمني للتحديث الإيجابي إلى 10 ثوانٍ لتهدئة الـ Logs تماماً
+                time.sleep(10)
 
         except GeneratorExit:
-            # يتم استدعاؤها فور إغلاق التبويب في المتصفح
             pass
         except Exception as e:
             current_app.logger.error(f"SSE Error: {e}")
@@ -563,23 +545,47 @@ def stream_peers_status():
             'Connection': 'keep-alive'
         }
     )
-
-from functools import lru_cache
-import time
+# --------------------------------------------------------------------------
+# Global Caches & ThreadPool
+# --------------------------------------------------------------------------
+executor = ThreadPoolExecutor(max_workers=20)
 
 _CUSTOMER_GROUPS_CACHE = {}
-def get_cached_customer_peer_ids(customer, base_url, headers):
-    # استخدام customer_id الخاص بالموديل بدلاً من id
-    cid = getattr(customer, 'customer_id', getattr(customer, 'id', None))
-    if not cid:
-        return _get_customer_group_peer_ids(customer)
+_NETBIRD_PEERS_CACHE = {"data": None, "timestamp": 0}
 
+def get_cached_customer_peer_ids(customer):
+    """جلب قائمة الـ Peers المسموحة للعميل مع كاش لمدة 60 ثانية"""
+    if not customer or not getattr(customer, 'netbird_group_id', None):
+        return set()
+
+    cid = getattr(customer, 'customer_id', getattr(customer, 'id', None))
     now = time.time()
+    
     if cid in _CUSTOMER_GROUPS_CACHE:
         peer_ids, cached_time = _CUSTOMER_GROUPS_CACHE[cid]
-        if now - cached_time < 30:  # 30 ثانية صلاحية
+        if now - cached_time < 60:  # 60 ثانية كاش
             return peer_ids
 
     peer_ids = _get_customer_group_peer_ids(customer)
     _CUSTOMER_GROUPS_CACHE[cid] = (peer_ids, now)
     return peer_ids
+
+def get_cached_all_netbird_peers(base_url, headers, cache_ttl=5):
+    """كاش لقائمة كل الـ Peers من NetBird لمدة 5 ثوانٍ لمنع التكرار الشديد"""
+    now = time.time()
+    if _NETBIRD_PEERS_CACHE["data"] is not None and (now - _NETBIRD_PEERS_CACHE["timestamp"] < cache_ttl):
+        return _NETBIRD_PEERS_CACHE["data"]
+
+    try:
+        resp = requests.get(f"{base_url}/api/v2/netbird/peers", headers=headers, timeout=5)
+        if resp.status_code == 200:
+            peers_data = resp.json()
+            if isinstance(peers_data, dict):
+                peers_data = [peers_data]
+            _NETBIRD_PEERS_CACHE["data"] = peers_data
+            _NETBIRD_PEERS_CACHE["timestamp"] = now
+            return peers_data
+    except Exception as e:
+        current_app.logger.error(f"Error fetching netbird peers: {e}")
+
+    return _NETBIRD_PEERS_CACHE["data"] or []

@@ -1,3 +1,417 @@
+
+<body>
+    <nav class="navbar">
+        <div class="logo">
+            <img src="{{ url_for('static', filename='networkat.png') }}" alt="Networkat Logo"
+                style="height: 40px; width: auto; vertical-align: middle;">
+            <span>Networkat</span>
+        </div>
+        <div class="nav-links">
+            <a href="/" class="nav-link active">Dashboard</a>
+        </div>
+        <div class="user-menu">
+            <span class="customer-name">
+                <i class="fas fa-user-circle"></i> {{ customer_name }}
+            </span>
+            <a href="/logout" class="logout-btn">
+                <i class="fas fa-sign-out-alt"></i> Sign out
+            </a>
+        </div>
+    </nav>
+
+    <div class="container">
+        <!-- Welcome Card -->
+        <div class="welcome-card">
+            <h1>Welcome, {{ customer_name }}</h1>
+        </div>
+        <!-- Customer Setup Key Section -->
+        <div class="card">
+            <div class="card-header">
+                <h3><i class="fas fa-key"></i> My Setup Key</h3>
+            </div>
+            <div class="table-responsive">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Setup Key</th>
+                            <th>Status</th>
+                            <th>Created</th>
+                        </tr>
+                    </thead>
+                    <tbody id="setup-keys-table-body">
+                        <tr>
+                            <td colspan="3" class="text-center"
+                                style="text-align: center; padding: 2rem; color: var(--gray-600);">Loading...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        <!-- Stats -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h3>Total Edges</h3>
+                <!-- أضفنا id="total-edges-val" -->
+                <div class="value" id="total-edges-val">{{ total_edges }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Online Edges</h3>
+                <!-- أضفنا id="online-edges-val" -->
+                <div class="value" id="online-edges-val" style="color: #107c10;">{{ online_edges }}</div>
+            </div>
+            <div class="stat-card">
+                <h3>Offline Edges</h3>
+                <!-- أضفنا id="offline-edges-val" -->
+                <div class="value" id="offline-edges-val" style="color: #dc3545;">{{ offline_edges }}</div>
+            </div>
+        </div>
+
+        <!-- جدول الأجهزة المطور -->
+        <div class="card">
+            <div class="card-header">
+                <h3><i class="fas fa-desktop"></i> Your Edge Devices</h3>
+            </div>
+            <div class="table-responsive">
+                <table>
+                    <thead>
+                        <tr>
+                            <!-- <th>Peer ID</th> -->
+                            <th>Device Name</th>
+                            <th>Network Route</th> <!-- العمود الجديد -->
+                            <th>Status</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% if netbird_peers and netbird_peers|length > 0 %}
+                        {% for peer in netbird_peers %}
+                        <tr>
+                            <td>
+                                <input type="text" class="table-input" id="inline-name-{{ peer.id }}"
+                                    value="{{ peer.name }}" placeholder="Device Name">
+                            </td>
+                            <td>
+                                <input type="text" class="table-input inline-route-field"
+                                    id="inline-route-{{ peer.id }}" data-peer-id="{{ peer.id }}"
+                                    placeholder="e.g. 192.168.87.0/24" value="{{ peer.route or '' }}">
+                            </td>
+                            <td>
+                                <span
+                                    class="badge {% if peer.connected %}badge-success{% else %}badge-inactive{% endif %}"
+                                    id="status-badge-{{ peer.id }}" data-peer-name="{{ peer.name }}"
+                                    data-last-seen="{{ peer.last_seen or '' }}">
+                                    <i class="fas fa-circle" style="font-size: 0.5rem;"></i>
+                                    {% if peer.connected %}
+                                    Connected
+                                    {% else %}
+                                    Offline
+                                    {% endif %}
+                                </span>
+                            </td>
+                            <td>
+                                <div class="actions-cell">
+                                    <button class="action-btn btn-success-style"
+                                        onclick="saveInlineChanges('{{ peer.id }}')">
+                                        <i class="fas fa-save"></i> Save
+                                    </button>
+                                    <a href="/peers/{{ peer.id }}/filtering?name={{ peer.name | urlencode }}"
+                                        id="filter-link-{{ peer.id }}" target="_blank" class="action-btn"
+                                        style="background-color: #00b06f; color: white; text-decoration: none; display: inline-flex; align-items: center; gap: 0.35rem;">
+                                        <i class="fas fa-shield-alt"></i> Filters
+                                    </a>
+                                </div>
+
+                            </td>
+                        </tr>
+                        {% endfor %}
+                        {% else %}
+                        <tr>
+                            <td colspan="5" class="text-center"
+                                style="text-align: center; padding: 3rem; color: var(--gray-600);">
+                                No edge devices found in this customer group.
+                            </td>
+                        </tr>
+                        {% endif %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        <div class="footer">
+            <i class="fas fa-circle" style="color: #10b981; font-size: 0.5rem;"></i> Online ·
+            <i class="fas fa-circle" style="color: #f59e0b; font-size: 0.5rem;"></i> Stale (>5min) ·
+            <i class="fas fa-circle" style="color: var(--gray-600); font-size: 0.5rem;"></i> Offline
+        </div>
+    </div>
+    <!--  -->
+    <script>
+        // إغلاق المودالز عند الضغط خارج المساحة البيضاء
+        window.onclick = function (event) {
+            if (event.target.classList.contains('custom-modal')) {
+                event.target.classList.remove('show');
+            }
+        }
+
+        // 1. جلب الـ Routes فقط (عند التحميل وحفظ التعديلات)
+        async function fetchAndPopulateRoutes() {
+            try {
+                const routesRes = await fetch('/api/v2/netbird/routes').catch(() => null);
+                const routes = (routesRes && routesRes.ok) ? await routesRes.json() : [];
+
+                const routeInputs = document.querySelectorAll('.inline-route-field');
+                for (const input of routeInputs) {
+                    const peerId = input.getAttribute('data-peer-id');
+                    const peerRoute = routes.find(r => r.peer === peerId);
+
+                    if (document.activeElement !== input) {
+                        input.value = peerRoute ? peerRoute.network : '';
+                    }
+
+                    if (peerRoute) {
+                        input.setAttribute('data-route-id', peerRoute.id);
+                        input.setAttribute('data-route-network-id', peerRoute.network_id);
+                    } else {
+                        input.removeAttribute('data-route-id');
+                        input.removeAttribute('data-route-network-id');
+                    }
+                }
+            } catch (err) {
+                console.error('Error fetching routes:', err);
+            }
+        }
+
+        // 2. تحديث الحالة في الواجهة فور استقبال حدث SSE من السيرفر
+        function updatePeerStatusesFromSSE(data) {
+            if (!data || !data.peers) return;
+
+            data.peers.forEach(peer => {
+                const statusBadge = document.getElementById(`status-badge-${peer.id}`);
+                if (!statusBadge) return;
+
+                const timeAgoText = timeAgo(peer.last_seen);
+                statusBadge.style.backgroundColor = "";
+                statusBadge.style.color = "";
+
+                if (peer.is_online) {
+                    // NetBird connected + Agent reachable
+                    statusBadge.className = "badge badge-success";
+                    statusBadge.innerHTML = `<i class="fas fa-circle" style="font-size: 0.5rem;"></i> Connected`;
+                } else if (peer.connected && !peer.is_reachable) {
+                    // NetBird connected but Agent offline
+                    statusBadge.className = "badge badge-inactive";
+                    statusBadge.innerHTML = `<i class="fas fa-circle" style="font-size: 0.5rem;"></i> Offline (${timeAgoText})`;
+                } else {
+                    // NetBird disconnected
+                    statusBadge.className = "badge badge-inactive";
+                    statusBadge.innerHTML = `<i class="fas fa-circle" style="font-size: 0.5rem;"></i> Offline (${timeAgoText})`;
+                }
+            });
+
+            if (data.summary) {
+                const totalEl = document.getElementById('total-edges-val');
+                const onlineEl = document.getElementById('online-edges-val');
+                const offlineEl = document.getElementById('offline-edges-val');
+
+                if (totalEl) totalEl.innerText = data.summary.total;
+                if (onlineEl) onlineEl.innerText = data.summary.online;
+                if (offlineEl) offlineEl.innerText = data.summary.offline;
+            }
+        }
+
+        // متغير عالمي للحفاظ على الاتصال
+        let globalEventSource = null;
+        function initPeersSSE() {
+            if (globalEventSource && globalEventSource.readyState !== EventSource.CLOSED) {
+                return;
+            }
+            globalEventSource = new EventSource('/api/peers/stream');
+            globalEventSource.onmessage = function (event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    updatePeerStatusesFromSSE(data);
+                } catch (e) {
+                    console.error("Error parsing SSE data:", e);
+                }
+            };
+
+            globalEventSource.onmessage = function (event) {
+                // ✅ تجاهل الـ ping (بيجي كـ comment مش data)
+                if (!event.data || event.data.trim() === '') return;
+
+                try {
+                    const data = JSON.parse(event.data);
+
+                    // ✅ لو الـ session انتهت، reload الصفحة
+                    if (data.error === 'session_expired') {
+                        window.location.href = '/login';
+                        return;
+                    }
+
+                    // ✅ لو fetch فشل، متعملش حاجة — استنى الـ cycle الجاي
+                    if (data.error === 'fetch_failed') return;
+
+                    updatePeerStatusesFromSSE(data);
+                } catch (e) {
+                    console.error("Error parsing SSE data:", e);
+                }
+            };
+        }
+
+        async function saveInlineChanges(peerId) {
+            const nameInput = document.getElementById(`inline-name-${peerId}`);
+            const routeInput = document.getElementById(`inline-route-${peerId}`);
+
+            const newName = nameInput ? nameInput.value.trim() : '';
+            const newRouteNetwork = routeInput ? routeInput.value.trim() : '';
+
+            if (!newName) {
+                alert('Please enter a valid device name.');
+                return;
+            }
+
+            try {
+                const nameResponse = await fetch(`/peers/${peerId}/update`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: newName })
+                });
+
+                const nameData = await nameResponse.json();
+                if (!nameResponse.ok || nameData.error) {
+                    throw new Error(nameData.error || 'Failed to update device name.');
+                }
+
+                const existingRouteId = routeInput.getAttribute('data-route-id');
+                const existingNetworkId = routeInput.getAttribute('data-route-network-id');
+
+                if (newRouteNetwork) {
+                    const networkId = existingNetworkId || `route-${peerId.substring(0, 8)}`;
+
+                    const routeBody = {
+                        "description": `Route handled via inline dashboard for peer ${peerId}`,
+                        "network_id": networkId,
+                        "enabled": true,
+                        "peer": peerId,
+                        "network": newRouteNetwork,
+                        "metric": 9999,
+                        "masquerade": true,
+                        "keep_route": true,
+                        "groups": []
+                    };
+
+                    if (existingRouteId && existingRouteId !== 'null' && existingRouteId !== 'undefined') {
+                        const routeRes = await fetch(`/api/v2/netbird/routes/${existingRouteId}`, {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(routeBody)
+                        });
+
+                        if (!routeRes.ok) {
+                            const errData = await routeRes.json().catch(() => ({}));
+                            throw new Error(errData.message || errData.detail || `Route PUT failed with status ${routeRes.status}`);
+                        }
+                    } else {
+                        const createRes = await fetch('/api/v2/netbird/routes', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(routeBody)
+                        });
+
+                        if (!createRes.ok) {
+                            const errData = await createRes.json().catch(() => ({}));
+                            throw new Error(errData.message || errData.detail || `Route POST failed with status ${createRes.status}`);
+                        }
+                    }
+                } else if (existingRouteId) {
+                    await fetch(`/api/v2/netbird/routes/${existingRouteId}`, { method: 'DELETE' });
+                }
+
+                await fetchAndPopulateRoutes();
+                alert('Device adjustments saved successfully!');
+            } catch (error) {
+                console.error('Save Error:', error);
+                alert('Error while saving updates: ' + error.message);
+            }
+        }
+
+        function fetchSetupKeys() {
+            fetch('/api/customer/setup-keys')
+                .then(response => response.json())
+                .then(data => {
+                    const tbody = document.getElementById('setup-keys-table-body');
+                    if (!tbody) return;
+                    tbody.innerHTML = '';
+
+                    if (data.tokens && data.tokens.length > 0) {
+                        data.tokens.forEach(tokenObj => {
+                            const statusClass = tokenObj.is_active ? 'badge-active' : 'badge-inactive';
+                            const statusText = tokenObj.is_active ? 'Active' : 'Inactive';
+
+                            const row = `
+                <tr>
+                <td>
+                    <div class="token-container">
+                    <span class="token-value">${tokenObj.token}</span>
+                    <button class="copy-btn" onclick="copySetupKey('${tokenObj.token}', this)" title="Copy setup key">
+                        <i class="far fa-copy"></i>
+                    </button>
+                    </div>
+                </td>
+                <td><span class="badge ${statusClass}">${statusText}</span></td>
+                <td>${tokenObj.created_at}</td>
+                </tr>
+            `;
+                            tbody.innerHTML += row;
+                        });
+                    } else {
+                        tbody.innerHTML = `<tr><td colspan="3" class="text-center" style="text-align: center; padding: 3rem; color: var(--gray-600);">No setup key found.</td></tr>`;
+                    }
+                }).catch(err => console.error(err));
+        }
+
+        function copySetupKey(token, buttonElement) {
+            navigator.clipboard.writeText(token).then(() => {
+                const icon = buttonElement.querySelector('i');
+                icon.className = 'fas fa-check';
+                buttonElement.classList.add('copied');
+                setTimeout(() => {
+                    icon.className = 'far fa-copy';
+                    buttonElement.classList.remove('copied');
+                }, 2000);
+            });
+        }
+
+        function timeAgo(dateString) {
+            if (!dateString) return 'Never';
+            const now = new Date();
+            const past = new Date(dateString);
+
+            if (isNaN(past.getTime())) return 'Never';
+
+            const msPerMinute = 60 * 1000;
+            const msPerHour = msPerMinute * 60;
+            const msPerDay = msPerHour * 24;
+            const elapsed = now - past;
+
+            if (elapsed < msPerMinute) {
+                return 'Just now';
+            } else if (elapsed < msPerHour) {
+                return 'Since ' + Math.round(elapsed / msPerMinute) + 'm ago';
+            } else if (elapsed < msPerDay) {
+                return 'Since ' + Math.round(elapsed / msPerHour) + 'h ago';
+            } else {
+                return 'Since ' + Math.round(elapsed / msPerDay) + 'd ago';
+            }
+        }
+
+        document.addEventListener("DOMContentLoaded", function () {
+            fetchSetupKeys();
+            fetchAndPopulateRoutes();
+            initPeersSSE(); // تشغيل الـ SSE Stream المباشر بدلاً من setInterval
+        });
+    </script>
+</body>
+
+</html>
 import os
 import time
 import json
@@ -504,11 +918,6 @@ def proxy_delete_route(route_id):
 # SSE Real-time Peers Stream
 # --------------------------------------------------------------------------
 
-# executor = ThreadPoolExecutor(max_workers=20)
-# _cache_lock = Lock()
-
-# _CUSTOMER_GROUPS_CACHE = {}
-# _NETBIRD_PEERS_CACHE = {"data": None, "timestamp": 0}
 _HANDSHAKE_CACHE = {}  # { peer_id: (is_reachable, timestamp) }
 
 def get_cached_peer_handshake(peer_id, base_url, headers, cache_ttl=4):
@@ -544,7 +953,7 @@ def _check_single_peer_handshake(peer, base_url, headers):
     is_reachable = False
 
     if is_connected:
-        is_reachable = get_cached_peer_handshake(peer_id, base_url, headers, cache_ttl=4)
+        is_reachable = get_cached_peer_handshake(peer_id, base_url, headers, cache_ttl=15)
 
     real_online = is_connected and is_reachable
     return {
@@ -556,7 +965,10 @@ def _check_single_peer_handshake(peer, base_url, headers):
         "last_seen": peer.get("last_seen"),
         "ip": peer.get("ip")
     }
-
+import logging
+logger = logging.getLogger(__name__)
+SSE_PING_INTERVAL = 15
+SSE_DATA_INTERVAL = 20
 @client_bp.route('/api/peers/stream')
 @login_required
 def stream_peers_status():
@@ -568,54 +980,97 @@ def stream_peers_status():
     base_url = _get_api_base_url()
     headers = _get_api_headers()
 
+    # ✅ جيب كل البيانات الثابتة قبل الـ generator — مرة واحدة بس
+    allowed_peer_ids = get_cached_customer_peer_ids(customer)
+
     def generate_events():
+        nonlocal allowed_peer_ids
+        last_data_time = 0
+        last_ping_time = 0
+        # تتبع آخر وقت رفرشنا الـ allowed_peers
+        last_peers_refresh = time.time()
+
         try:
             while True:
-                allowed_peer_ids = get_cached_customer_peer_ids(customer)
-                if not allowed_peer_ids:
-                    payload = {"peers": [], "summary": {"total": 0, "online": 0, "offline": 0}}
-                    yield f"data: {json.dumps(payload)}\n\n"
-                    time.sleep(10)
-                    continue
+                now = time.time()
 
-                peers_data = get_cached_all_netbird_peers(base_url, headers, cache_ttl=5)
-                customer_peers = [p for p in peers_data if p.get("id") in allowed_peer_ids]
+                # Ping كل 15 ثانية
+                if now - last_ping_time >= SSE_PING_INTERVAL:
+                    yield ": ping\n\n"
+                    last_ping_time = now
 
-                processed_peers = []
-                online_count = 0
-                offline_count = 0
+                # ✅ رفرش الـ allowed_peer_ids كل 60 ثانية بس (مش كل cycle)
+                # بدون DB query — بيستخدم الكاش الموجود
+                if now - last_peers_refresh >= 60:
+                    allowed_peer_ids = get_cached_customer_peer_ids(customer)
+                    last_peers_refresh = now
 
-                if customer_peers:
-                    futures = [
-                        executor.submit(_check_single_peer_handshake, peer, base_url, headers)
-                        for peer in customer_peers
-                    ]
-                    for future in as_completed(futures):
-                        try:
-                            res = future.result()
-                            processed_peers.append(res)
-                            if res["is_online"]:
-                                online_count += 1
-                            else:
-                                offline_count += 1
-                        except Exception as err:
-                            current_app.logger.error(f"Error checking peer: {err}")
+                # Data كل 20 ثانية
+                if now - last_data_time >= SSE_DATA_INTERVAL:
+                    try:
+                        if not allowed_peer_ids:
+                            payload = {
+                                "peers": [],
+                                "summary": {"total": 0, "online": 0, "offline": 0}
+                            }
+                            yield f"data: {json.dumps(payload)}\n\n"
+                            last_data_time = now
+                            time.sleep(1)
+                            continue
 
-                payload = {
-                    "peers": processed_peers,
-                    "summary": {
-                        "total": len(processed_peers),
-                        "online": online_count,
-                        "offline": offline_count
-                    }
-                }
+                        peers_data = get_cached_all_netbird_peers(
+                            base_url, headers, cache_ttl=10
+                        )
+                        customer_peers = [
+                            p for p in peers_data
+                            if p.get("id") in allowed_peer_ids
+                        ]
 
-                yield f"data: {json.dumps(payload)}\n\n"
-                time.sleep(10)
+                        processed_peers = []
+                        online_count = 0
+
+                        if customer_peers:
+                            futures = {
+                                executor.submit(
+                                    _check_single_peer_handshake,
+                                    peer, base_url, headers
+                                ): peer
+                                for peer in customer_peers
+                            }
+                            for future in as_completed(futures, timeout=8):
+                                try:
+                                    res = future.result()
+                                    processed_peers.append(res)
+                                    if res["is_online"]:
+                                        online_count += 1
+                                except Exception as err:
+                                    logger.error(f"Peer check error: {err}")
+
+                        payload = {
+                            "peers": processed_peers,
+                            "summary": {
+                                "total": len(processed_peers),
+                                "online": online_count,
+                                "offline": len(processed_peers) - online_count
+                            }
+                        }
+                        yield f"data: {json.dumps(payload)}\n\n"
+                        last_data_time = now
+
+                    except Exception as e:
+                        # ✅ logger عادي مش current_app.logger
+                        logger.error(f"SSE data error: {e}")
+                        yield f"data: {json.dumps({'error': 'fetch_failed'})}\n\n"
+                        last_data_time = now
+
+                time.sleep(1)
+
         except GeneratorExit:
+            # ✅ logger عادي — Flask context مش مضمونة هنا
+            logger.info(f"SSE closed for customer {customer_id}")
             return
         except Exception as e:
-            current_app.logger.error(f"SSE Error: {e}")
+            logger.error(f"SSE fatal error: {e}")
 
     return Response(
         stream_with_context(generate_events()),
